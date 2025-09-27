@@ -24,10 +24,11 @@ import org.springframework.stereotype.Service;
 import org.springframework.web.client.RestTemplate;
 
 import java.time.LocalDate;
-import java.time.LocalDateTime;
 import java.time.LocalTime;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 import static com.example.bemsaseat.seat.config.RandomStringGenerator.generateRandomString;
@@ -40,6 +41,7 @@ public class SeatService {
     private final SeatRepository seatRepository;
     private final KakaoPayService kakaoPayService;
     private final RestTemplate restTemplate;
+    private final RedisLockService redisLockService;
     private static final Logger logger = LoggerFactory.getLogger(SeatService.class);
 
     @Value("${NAMESPACE}")
@@ -51,102 +53,121 @@ public class SeatService {
     public PurchaseResponseDTO purchaseSeats(SeatPurchaseRequest seatRequest, String email, String jwtToken) {
         log.info("Starting purchaseSeats process for email: {}", email);
         List<MinimalSeatDTO> minimalSeatDTOList = new ArrayList<>();
+        Map<String, String> acquiredLocks = new LinkedHashMap<>();
 
-        // 전체 좌석을 검증 수행
-        for (SeatDetail seatDetail : seatRequest.getSeats()) {
-            Optional<Seat> optionalSeat = seatRepository.findByEventNameAndSectionAndSeatNumberAndPriceAndEventTimeAndReservationStatus(
-                    seatDetail.getEventName(),
-                    seatDetail.getSection(),
-                    seatDetail.getSeatNumber(),
-                    seatDetail.getPrice(),
-                    seatDetail.getEventTime(),
-                    "NO"
-            );
-
-            if (!optionalSeat.isPresent()) {
-                log.error("Seat not available: EventName={}, Section={}, SeatNumber={}, EventTime={}",
-                        seatDetail.getEventName(), seatDetail.getSection(), seatDetail.getSeatNumber(), seatDetail.getEventTime());
-                throw new IllegalArgumentException("이미 구매된 자리입니다.");
-            }
-
-            Seat seat = optionalSeat.get();
-            if (seat.getPrice() != seatDetail.getPrice()) {
-                log.error("Price mismatch for seat: eventName={}, section={}, seatNumber={}, expectedPrice={}, actualPrice={}",
-                        seatDetail.getEventName(), seatDetail.getSection(), seatDetail.getSeatNumber(),
-                        seatDetail.getPrice(), seat.getPrice());
-                throw new IllegalArgumentException("가격이 일치하지 않습니다.");
-            }
-
-            // MinimalSeatDTO 생성 및 추가, 일단 여기서 0으로 좌석 번호 초기화
-            MinimalSeatDTO minimalSeatDTO = new MinimalSeatDTO(
-                    seatDetail.getEventName(),
-                    seatDetail.getSection(),
-                    seatDetail.getSeatNumber(),
-                    seatDetail.getPrice(),
-                    seatDetail.getEventTime(),
-                    LocalDate.now(),
-                    LocalTime.now(),
-                    "",  // 이후에 TID를 설정할 것이므로 초기화 상태로 남겨둔 부분
-                    NAMESPACE
-            );
-
-            minimalSeatDTOList.add(minimalSeatDTO);
-        }
-
-        // pay 값에 따라 처리
-        if (pay) {
-            // 카카오페이 결제 준비 로직
-            log.info("All seats validated, preparing KakaoPay payment...");
-            KakaoReadyResponse readyResponse = kakaoPayService.kakaoPayReady(seatRequest.getSeats(), email);
-            String tid = readyResponse.getTid();
-            log.info("KakaoPay payment ready response received, creating PurchaseResponseDTO...");
-
-            for (MinimalSeatDTO seatDTO : minimalSeatDTOList) {
-                seatDTO.setTid(tid);
-            }
-            return new PurchaseResponseDTO(readyResponse, email, minimalSeatDTOList.size(), jwtToken,minimalSeatDTOList); // 카카오페이 결제 응답
-        } else {
-
+        try {
+            // 전체 좌석을 검증 수행
             for (SeatDetail seatDetail : seatRequest.getSeats()) {
-                Seat seat = seatRepository.findByEventNameAndSectionAndSeatNumberAndEventTime(
+                String lockKey = buildSeatLockKey(seatDetail);
+                String lockToken = redisLockService.acquireLock(lockKey);
+                acquiredLocks.put(lockKey, lockToken);
+
+                Optional<Seat> optionalSeat = seatRepository.findByEventNameAndSectionAndSeatNumberAndPriceAndEventTimeAndReservationStatus(
                         seatDetail.getEventName(),
                         seatDetail.getSection(),
                         seatDetail.getSeatNumber(),
-                        seatDetail.getEventTime()
-                ).orElseThrow(() -> new IllegalArgumentException("좌석을 찾을 수 없습니다."));
+                        seatDetail.getPrice(),
+                        seatDetail.getEventTime(),
+                        "NO"
+                );
+
+                if (!optionalSeat.isPresent()) {
+                    log.error("Seat not available: EventName={}, Section={}, SeatNumber={}, EventTime={}",
+                            seatDetail.getEventName(), seatDetail.getSection(), seatDetail.getSeatNumber(), seatDetail.getEventTime());
+                    throw new IllegalArgumentException("이미 구매된 자리입니다.");
+                }
+
+                Seat seat = optionalSeat.get();
+                if (seat.getPrice() != seatDetail.getPrice()) {
+                    log.error("Price mismatch for seat: eventName={}, section={}, seatNumber={}, expectedPrice={}, actualPrice={}",
+                            seatDetail.getEventName(), seatDetail.getSection(), seatDetail.getSeatNumber(),
+                            seatDetail.getPrice(), seat.getPrice());
+                    throw new IllegalArgumentException("가격이 일치하지 않습니다.");
+                }
+
+                // MinimalSeatDTO 생성 및 추가, 일단 여기서 0으로 좌석 번호 초기화
+                MinimalSeatDTO minimalSeatDTO = new MinimalSeatDTO(
+                        seatDetail.getEventName(),
+                        seatDetail.getSection(),
+                        seatDetail.getSeatNumber(),
+                        seatDetail.getPrice(),
+                        seatDetail.getEventTime(),
+                        LocalDate.now(),
+                        LocalTime.now(),
+                        "",  // 이후에 TID를 설정할 것이므로 초기화 상태로 남겨둔 부분
+                        NAMESPACE
+                );
+
+                minimalSeatDTOList.add(minimalSeatDTO);
             }
-            String tid = generateRandomString(16);
-            for (MinimalSeatDTO seatDTO : minimalSeatDTOList) {
-                seatDTO.setTid(tid);
+
+            PurchaseResponseDTO response;
+
+            // pay 값에 따라 처리
+            if (pay) {
+                // 카카오페이 결제 준비 로직
+                log.info("All seats validated, preparing KakaoPay payment...");
+                KakaoReadyResponse readyResponse = kakaoPayService.kakaoPayReady(seatRequest.getSeats(), email);
+                String tid = readyResponse.getTid();
+                log.info("KakaoPay payment ready response received, creating PurchaseResponseDTO...");
+
+                for (MinimalSeatDTO seatDTO : minimalSeatDTOList) {
+                    seatDTO.setTid(tid);
+                }
+                response = new PurchaseResponseDTO(readyResponse, email, minimalSeatDTOList.size(), jwtToken, minimalSeatDTOList);
+            } else {
+
+                for (SeatDetail seatDetail : seatRequest.getSeats()) {
+                    Seat seat = seatRepository.findByEventNameAndSectionAndSeatNumberAndEventTime(
+                            seatDetail.getEventName(),
+                            seatDetail.getSection(),
+                            seatDetail.getSeatNumber(),
+                            seatDetail.getEventTime()
+                    ).orElseThrow(() -> new IllegalArgumentException("좌석을 찾을 수 없습니다."));
+                }
+                String tid = generateRandomString(16);
+                for (MinimalSeatDTO seatDTO : minimalSeatDTOList) {
+                    seatDTO.setTid(tid);
+                }
+
+                // 티켓 서버에 예약 요청 전송
+                log.info("Sending reservation requests to ticket server with seat information...");
+                sendPurchaseRequest(minimalSeatDTOList, jwtToken);
+
+                // 모든 예약된 좌석에 대해 예약 상태를 YES로 변경
+                for (MinimalSeatDTO seatDTO : minimalSeatDTOList) {
+                    Seat seat = seatRepository.findByEventNameAndSectionAndSeatNumberAndEventTime(
+                            seatDTO.getEventName(),
+                            seatDTO.getSection(),
+                            seatDTO.getSeatNumber(),
+                            seatDTO.getEventTime()
+                    ).orElseThrow(() -> new IllegalArgumentException("좌석을 찾을 수 없습니다."));
+
+                    // 좌석 예약 상태를 YES로 업데이트
+                    seat.setReservationStatus("YES");
+                    seatRepository.save(seat);
+                }
+
+                // 모든 예약된 좌석 정보를 담은 PurchaseResponseDTO 객체를 반환
+                PurchaseResponseDTO purchaseResponse = new PurchaseResponseDTO();
+                purchaseResponse.setBookedSeats(minimalSeatDTOList); // 예약된 좌석 정보 설정
+                purchaseResponse.setEmail(email);
+                purchaseResponse.setJwtToken(jwtToken);
+                purchaseResponse.setSeatNumber(minimalSeatDTOList.size()); // 예약된 좌석 수 설정
+
+                log.info("Returning booked seats information: {}", purchaseResponse);
+                response = purchaseResponse;
             }
 
-            // 티켓 서버에 예약 요청 전송
-            log.info("Sending reservation requests to ticket server with seat information...");
-            sendPurchaseRequest(minimalSeatDTOList, jwtToken);
-
-            // 모든 예약된 좌석에 대해 예약 상태를 YES로 변경
-            for (MinimalSeatDTO seatDTO : minimalSeatDTOList) {
-                Seat seat = seatRepository.findByEventNameAndSectionAndSeatNumberAndEventTime(
-                        seatDTO.getEventName(),
-                        seatDTO.getSection(),
-                        seatDTO.getSeatNumber(),
-                        seatDTO.getEventTime()
-                ).orElseThrow(() -> new IllegalArgumentException("좌석을 찾을 수 없습니다."));
-
-                // 좌석 예약 상태를 YES로 업데이트
-                seat.setReservationStatus("YES");
-                seatRepository.save(seat);
-            }
-
-            // 모든 예약된 좌석 정보를 담은 PurchaseResponseDTO 객체를 반환
-            PurchaseResponseDTO purchaseResponse = new PurchaseResponseDTO();
-            purchaseResponse.setBookedSeats(minimalSeatDTOList); // 예약된 좌석 정보 설정
-            purchaseResponse.setEmail(email);
-            purchaseResponse.setJwtToken(jwtToken);
-            purchaseResponse.setSeatNumber(minimalSeatDTOList.size()); // 예약된 좌석 수 설정
-
-            log.info("Returning booked seats information: {}", purchaseResponse);
-            return purchaseResponse;
+            return response;
+        } finally {
+            acquiredLocks.forEach((key, token) -> {
+                try {
+                    redisLockService.releaseLock(key, token);
+                } catch (Exception e) {
+                    log.warn("Failed to release lock for key={}: {}", key, e.getMessage());
+                }
+            });
         }
     }
 
@@ -268,6 +289,14 @@ public class SeatService {
     public List<Seat> getSeatsByEventName(String eventName) {
         // 공연 이름으로 좌석 조회
         return seatRepository.findByEventName(eventName);
+    }
+
+    private String buildSeatLockKey(SeatDetail seatDetail) {
+        return String.format("seat:lock:%s:%s:%d:%s",
+                seatDetail.getEventName(),
+                seatDetail.getSection(),
+                seatDetail.getSeatNumber(),
+                seatDetail.getEventTime());
     }
 
 }
