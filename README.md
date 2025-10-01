@@ -1,6 +1,6 @@
-# Clove BE (티켓 커머스 MSA)
+# Clove BE (티켓 커머스)
 
-> 공연 티켓팅과 굿즈 판매를 지원하는 Clove 백엔드 모놀리포입니다. Auth, Event, Seat, Ticket, Merch 서비스로 구성된 MSA 예제 프로젝트로, JWT 기반 인증과 Redis 분산락, 카카오페이 결제 연동을 핵심으로 합니다.
+> 공연 티켓팅과 굿즈 판매를 지원하는 Clove 백엔드 모놀리포입니다. Auth, Event, Seat, Ticket, Merch 서비스로 구성된 프로젝트로, JWT 기반 인증과 Redis 분산락, 카카오페이 결제 연동을 핵심으로 합니다.
 
 # 전체 프로젝트 링크
 https://github.com/pnucse-capstone-2024/Capstone-2024-team-20
@@ -128,14 +128,3 @@ Ticket 서비스
 
 - `sendPurchaseRequest`는 좌석 정보를 티켓 서비스 API로 전송하고 성공 시 `confirmSeatPurchase`에서 좌석 예약 상태를 업데이트합니다.
 - 승인 이후 Ticket 서비스가 실제 티켓을 생성하며, 필요 시 Merch 서비스와 연계해 번들 상품을 제안할 수 있습니다.
-
-## 로컬 실행 가이드
-
-각 서비스는 독립 Gradle 프로젝트입니다. 공통적으로 Java 17, Spring Boot, Gradle Wrapper를 사용합니다.
-
-```bash
-# 예) Auth 서비스 실행
-cd BE-AUTH
-./gradlew bootRun
-```
-
