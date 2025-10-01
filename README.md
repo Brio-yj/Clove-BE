@@ -17,6 +17,21 @@ https://github.com/pnucse-capstone-2024/Capstone-2024-team-20
 | **BE-TICKET** | 구매 확정 좌석으로 티켓 발급, 재고 동기화 | [`TicketService`](BE-TICKET/BE-TICKET-NO-KAKAO/src/main/java/com/example/bemsaticket/ticket/service/TicketService.java) |
 | **BE-MERCH** | 공연 굿즈 판매, 카카오페이 결제/환불 | [`MerchService`](BE-MERCH/BE-MERCH-KAKAO/src/main/java/com/example/bemerch/merch/service/MerchService.java) |
 
+
+## **트러블 슈팅 **
+1. 대규모 트래픽으로 인한 인증 서버 과부하
+
+❓**문제 배경**: 티켓팅 플랫폼 특성상 예매 시작 시점의 트래픽 폭증은 피할 수 없었습니다. 기존 세션 인증 방식은 서버 메모리에 부담을 주어, 서버 과부하나 인증 오류를 유발할 잠재적위험이 있었습니다.
+
+❗**문제 해결**: 서버 상태 의존성을 제거하기 위해 Stateless 한 JWT 토큰 기반 인증 방식으로 전환했습니다. 또한, Access/Refresh 토큰을 분리하고 HttpOnly 쿠키를 적용하여 보안을 강화하며 안정적인 인증 시스템을 구축했습니다.
+
+2. 동시 요청으로 인한 데이터 불일치
+
+❓**문제 배경**: 여러 사용자가 동시에 같은 좌석을 선택하거나 구매 요청을 할 경우, 데이터 정합성이 깨지는 문제가 발생했습니다.
+
+❗**문제 해결**: In-Memory 기반의 Redis 분산 락을 적용하여 문제를 해결했습니다. 실제DB 트랜잭션을 시작하기 전, Redis에서 짧은 시간 동안 락을 획득하도록 설계했습니다. 
+이를 통해 DB에 가해지는 부하와 락 경합을 최소화하면서도 데이터 정합성을 보장할 수있었습니다.
+
 ## 인증 & 권한 (JWT)
 
 Auth 서비스는 `TokenProvider`를 통해 사용자 컨텍스트를 토큰에 주입하여 모든 마이크로서비스에서 일관되게 활용할 수 있게 합니다.
