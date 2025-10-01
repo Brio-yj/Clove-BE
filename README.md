@@ -139,6 +139,3 @@ cd BE-AUTH
 ./gradlew bootRun
 ```
 
-## 참고 링크
-
-- [mini-spring-boot 예시 README](https://github.com/MilkTea24/mini-spring-boot)
