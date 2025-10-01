@@ -1,6 +1,6 @@
 # Clove BE (티켓 커머스 MSA)
 
-> 공연 티켓팅과 굿즈 판매를 지원하는 Clove 백엔드 모놀리포. Auth, Event, Seat, Ticket, Merch 서비스로 구성된 MSA 예제 프로젝트입니다. 각 모듈은 독립적으로 배포 가능하며, JWT 기반 인증과 Redis 분산락으로 좌석 선점 충돌을 제어합니다.
+> 공연 티켓팅과 굿즈 판매를 지원하는 Clove 백엔드 모놀리포입니다. Auth, Event, Seat, Ticket, Merch 서비스로 구성된 MSA 예제 프로젝트로, JWT 기반 인증과 Redis 분산락, 카카오페이 결제 연동을 핵심으로 합니다.
 
 ## 전체 아키텍처
 
@@ -10,69 +10,132 @@
    ├──▶ API Gateway (외부 구성)
    │        │
    │        ├──▶ Auth 서비스 ──┐  (회원 가입/로그인, JWT 발급)
-   │        ├──▶ Event 서비스 ─┼──▶ Seat 서비스 (좌석 조회·선점)
+   │        ├──▶ Event 서비스 ─┼──▶ Seat 서비스 (좌석 조회·선점·결제)
    │        ├──▶ Merch 서비스 ─┤
    │        └──▶ Ticket 서비스 ─┘
    │
    └──▶ Kafka · Redis · MySQL · S3 (공유 인프라)
 ```
 
-- **Auth**: 회원 인증과 토큰 발급, 카프카로 이메일 알림 전송.
-- **Event**: 판매자가 이벤트 정보를 등록/수정하고 S3에 이미지 자산을 관리.
-- **Seat**: 공연 좌석 조회와 카카오페이/내부 결제 연동, Redis 락으로 중복 선점 방지.
-- **Ticket**: 좌석 구매 확정 후 실제 티켓 정보를 생성/저장.
-- **Merch**: 공연 관련 굿즈를 조회/구매하는 도메인.
-
-## 핵심 기능 요약
-
-| 도메인 | 핵심 기능 | 연관 클래스 |
+| 모듈 | 책임 | 대표 클래스 |
 | --- | --- | --- |
-| Auth | JWT Access/Refresh 토큰 발급·검증, Refresh 토큰 저장 및 재발급 | [`TokenProvider`](BE-AUTH/src/main/java/com/example/msaauth/jwt/TokenProvider.java), [`AuthService`](BE-AUTH/src/main/java/com/example/msaauth/service/AuthService.java) |
-| Event | 이벤트 등록/수정, S3 이미지 업로드, 판매자 인증 | [`EventController`](BE-EVENT/src/main/java/com/example/msaeventinformation/controller/EventController.java), [`EventService`](BE-EVENT/src/main/java/com/example/msaeventinformation/service/EventService.java) |
-| Seat | 좌석 검증, 카카오페이 결제 준비, Redis 분산락 기반 좌석 선점 | [`SeatService`](BE-SEAT/BE-SEAT-YES-NUMBER-YES-KAKAO/src/main/java/com/example/bemsaseat/seat/service/SeatService.java), [`RedisLockRepository`](BE-SEAT/BE-SEAT-YES-NUMBER-NO-KAKAO/src/main/java/com/example/seat/RedisLockRepository.java) |
-| Ticket | 구매 완료 좌석으로 티켓 생성, 인증 필터 적용 | [`TicketService`](BE-TICKET/BE-TICKET-NO-KAKAO/src/main/java/com/example/bemsaticket/ticket/service/TicketService.java) |
-| Merch | 굿즈 조회/결제, 인증 필터 공유 | [`MerchService`](BE-MERCH/BE-MERCH-NO-KAKAO/src/main/java/com/example/bemerch/merch/service/MerchService.java) |
+| **BE-AUTH** | 회원 인증, JWT Access/Refresh 토큰 발급 및 재발급, Kafka 알림 | [`TokenProvider`](BE-AUTH/src/main/java/com/example/msaauth/jwt/TokenProvider.java) |
+| **BE-EVENT** | 공연/세션 등록·수정, S3 이미지 업로드, 판매자 검증 | [`EventService`](BE-EVENT/src/main/java/com/example/msaeventinformation/service/EventService.java) |
+| **BE-SEAT** | 좌석 검증·선점, Redis 분산락, 카카오페이 결제 준비/승인, 티켓 서버 연동 | [`SeatService`](BE-SEAT/BE-SEAT-YES-NUMBER-YES-KAKAO/src/main/java/com/example/bemsaseat/seat/service/SeatService.java) |
+| **BE-TICKET** | 구매 확정 좌석으로 티켓 발급, 재고 동기화 | [`TicketService`](BE-TICKET/BE-TICKET-NO-KAKAO/src/main/java/com/example/bemsaticket/ticket/service/TicketService.java) |
+| **BE-MERCH** | 공연 굿즈 판매, 카카오페이 결제/환불 | [`MerchService`](BE-MERCH/BE-MERCH-KAKAO/src/main/java/com/example/bemerch/merch/service/MerchService.java) |
 
-## JWT 인증 흐름
+## 인증 & 권한 (JWT)
 
-1. **로그인 요청** – `AuthService.login`이 입력한 이메일/비밀번호를 인증하고 `TokenProvider`로 Access/Refresh 토큰을 생성합니다.
-2. **토큰 응답** – Access 토큰은 사용자 권한, 이메일, 멤버 ID를 담고 100분 동안 유효합니다. Refresh 토큰은 7일 TTL로 DB(`RefreshTokenRepository`)에 저장합니다.
-3. **요청 보호** – 각 도메인 서비스는 공통 `JwtAuthenticationFilter`를 통해 헤더의 Access 토큰을 파싱, `TokenProvider`로 유저를 복원하고 `SecurityContext`에 주입합니다.
-4. **재발급/로그아웃** – Refresh 토큰 검증 후 새 Access 토큰을 발급하거나, 로그아웃 시 저장된 Refresh 토큰을 삭제합니다.
+Auth 서비스는 `TokenProvider`를 통해 사용자 컨텍스트를 토큰에 주입하여 모든 마이크로서비스에서 일관되게 활용할 수 있게 합니다.
 
-> Access 토큰 Payload에는 `memberEmail`, `memberAuthority`, `memberId`가 포함되어 있어 마이크로서비스 간 유저 컨텍스트 공유가 용이합니다.
+```java
+// BE-AUTH/src/main/java/com/example/msaauth/jwt/TokenProvider.java
+String accessToken = Jwts.builder()
+        .setSubject(authentication.getName())
+        .claim("auth", authorities)            // 권한 정보
+        .claim("memberId", memberId)          // 회원 식별자
+        .claim("memberEmail", member.getEmail())
+        .claim("memberAuthority", member.getAuthority().name())
+        .setExpiration(accessTokenExpiresIn)
+        .signWith(key, SignatureAlgorithm.HS512)
+        .compact();
+```
 
-## Redis 좌석 선점 전략
+- Access 토큰은 100분, Refresh 토큰은 7일 TTL을 갖고 `MemberRepository`를 통해 멤버 정보와 연결됩니다.【F:BE-AUTH/src/main/java/com/example/msaauth/jwt/TokenProvider.java†L33-L77】
+- 도메인 서비스들은 공통 `JwtAuthenticationFilter`를 적용하여 요청 헤더에서 토큰을 파싱하고 `SecurityContext`에 사용자 정보를 주입합니다.
+- Refresh 토큰으로 재발급 시 `getAuthenticationFromRefreshToken`이 토큰의 Subject를 멤버 ID로 해석해 다시 `UserDetails`를 로드합니다.【F:BE-AUTH/src/main/java/com/example/msaauth/jwt/TokenProvider.java†L79-L118】
 
-실시간 좌석 예매에서는 동일 좌석을 동시에 선택하는 시나리오가 잦기 때문에 Seat 서비스는 Redis 기반 분산 락을 제공합니다.
+## 좌석 충돌 방지 (Redis 분산락)
 
-1. **락 획득** – `RedisLockRepository.lock(seatId)`가 `lock:seat:{seatId}` 키를 `SETNX`로 생성해 3초 TTL을 부여합니다. 이미 존재하면 예외를 던져 중복 선점을 차단합니다.
-2. **좌석 검증** – 락을 획득한 요청만 실제 좌석 상태를 조회/검증(`SeatRepository.findBy...`)하고 결제 준비로 진입합니다.
-3. **락 해제** – 결제 성공/실패와 관계없이 `finally` 블록에서 `unlock(seatId)`로 키를 삭제하여 다른 사용자가 다시 시도할 수 있습니다.
+동시에 같은 좌석을 고르는 상황을 해결하기 위해 Seat 서비스는 Redis 기반 분산락을 사용합니다.
 
-결과적으로 동일 좌석에 대한 경쟁 요청은 직렬화되어, **중복 결제/티켓 발급**을 방지합니다.
+```java
+// BE-SEAT/BE-SEAT-YES-NUMBER-NO-KAKAO/src/main/java/com/example/seat/RedisLockRepository.java
+public boolean lock(Long seatId) {
+    return Boolean.TRUE.equals(
+        redisTemplate.opsForValue().setIfAbsent(KEY_PREFIX + seatId, "locked", Duration.ofSeconds(3))
+    );
+}
+```
 
-## 좌석 구매 프로세스
+- `RedisLockRepository.lock`이 `SETNX`와 TTL을 이용해 좌석 키(`lock:seat:{id}`)를 생성하고 실패 시 바로 예외를 던져 경쟁 요청을 차단합니다.【F:BE-SEAT/BE-SEAT-YES-NUMBER-NO-KAKAO/src/main/java/com/example/seat/RedisLockRepository.java†L13-L21】
+- `SeatService.reserveSeat`는 락 획득/해제를 `try/finally`로 감싸 좌석 예약 로직이 실패해도 락이 해제되도록 보장합니다.【F:BE-SEAT/BE-SEAT-YES-NUMBER-NO-KAKAO/src/main/java/com/example/seat/SeatService.java†L12-L22】
+- 결제 전 검증 단계에서는 좌석 가격, 상태 등을 다시 확인하여 동시성 오류를 줄입니다.【F:BE-SEAT/BE-SEAT-YES-NUMBER-YES-KAKAO/src/main/java/com/example/bemsaseat/seat/service/SeatService.java†L83-L118】
+
+## 카카오페이 결제 흐름
+
+Seat·Merch 서비스는 카카오페이 `Ready → Approve → (optional) Cancel` 플로우를 구현하여 외부 결제와 내부 좌석/재고 상태를 동기화합니다.
+
+### 1. 결제 준비 (Ready)
+
+```java
+// BE-SEAT/BE-SEAT-YES-NUMBER-NO-KAKAO/src/main/java/com/example/bemsaseat/kakao/KakaoPayService.java
+public KakaoReadyResponse kakaoPayReady(List<SeatDetail> seatDetails, String email) {
+    Map<String, Object> parameters = new HashMap<>();
+    parameters.put("cid", kakaoPayProperties.getCid());
+    parameters.put("partner_order_id", "clove");
+    parameters.put("partner_user_id", email);
+    parameters.put("item_name", itemNames(seatDetails));
+    parameters.put("quantity", seatDetails.size());
+    parameters.put("total_amount", totalAmount(seatDetails));
+    parameters.put("approval_url", successUrl());
+    // ... fail/cancel URL 설정
+    HttpEntity<Map<String, Object>> requestEntity = new HttpEntity<>(parameters, getHeaders());
+    KakaoReadyResponse response = restTemplate.postForObject(READY_API, requestEntity, KakaoReadyResponse.class);
+    purchaseResponseDTO = new PurchaseResponseDTO(response, email, 0);
+    return response;
+}
+```
+
+- 좌석 정보로 주문명을 구성하고 총액을 계산한 뒤 카카오페이 오픈 API `/payment/ready`에 전송합니다.【F:BE-SEAT/BE-SEAT-YES-NUMBER-NO-KAKAO/src/main/java/com/example/bemsaseat/kakao/KakaoPayService.java†L52-L103】
+- 응답의 `tid`는 `PurchaseResponseDTO`에 저장되어 이후 승인/환불 단계에서 참조됩니다.【F:BE-SEAT/BE-SEAT-YES-NUMBER-NO-KAKAO/src/main/java/com/example/bemsaseat/kakao/KakaoPayService.java†L104-L107】
+
+Seat 서비스는 `pay=true`인 요청에 대해 준비 응답을 받아 좌석 DTO에 `tid`를 주입한 뒤 클라이언트에 결제 URL을 전달합니다.【F:BE-SEAT/BE-SEAT-YES-NUMBER-YES-KAKAO/src/main/java/com/example/bemsaseat/seat/service/SeatService.java†L118-L154】
+
+### 2. 결제 승인 (Approve)
+
+```java
+// BE-SEAT/BE-SEAT-YES-NUMBER-NO-KAKAO/src/main/java/com/example/bemsaseat/kakao/KakaoPayService.java
+public KakaoApproveResponse approveResponse(String pgToken) {
+    validatePurchaseContext();
+    Map<String, String> parameters = new HashMap<>();
+    parameters.put("cid", kakaoPayProperties.getCid());
+    parameters.put("tid", purchaseResponseDTO.getKakaoReadyResponse().getTid());
+    parameters.put("pg_token", pgToken);
+    KakaoApproveResponse approveResponse = restTemplate.postForObject(APPROVE_API, requestEntity, KakaoApproveResponse.class);
+    return approveResponse;
+}
+```
+
+- 성공 콜백에서 받은 `pg_token`과 `tid`로 `/payment/approve` API를 호출해 결제를 확정합니다.【F:BE-SEAT/BE-SEAT-YES-NUMBER-NO-KAKAO/src/main/java/com/example/bemsaseat/kakao/KakaoPayService.java†L128-L172】
+- Seat Controller는 승인 응답의 `tid`로 `PurchaseResponseDTO`를 조회하여 이미 선점해둔 좌석 정보를 꺼내고, 티켓 서비스로 전달합니다.【F:BE-SEAT/BE-SEAT-YES-NUMBER-YES-KAKAO/src/main/java/com/example/bemsaseat/SeatController.java†L83-L110】
+
+### 3. 굿즈 결제/환불 (Merch 서비스)
+
+Merch 서비스 역시 동일한 KakaoPay 서비스 로직을 구현하며, 환불 시 `/payment/cancel` API를 호출하여 굿즈 재고를 복구합니다.【F:BE-MERCH/BE-MERCH-KAKAO/src/main/java/com/example/bemerch/merch/service/MerchService.java†L118-L256】【F:BE-MERCH/BE-MERCH-KAKAO/src/main/java/com/example/bemerch/kakao/KakaoPayService.java†L45-L188】
+
+## 좌석 구매 전체 프로세스
 
 ```
 [사용자]
-  │ 1. 좌석 선택 요청 (JWT 포함)
+  │ 1. 좌석 선택 요청 (JWT + pay=true/false)
   ▼
 Seat 서비스
-  │ 2. Redis 락 획득 + 좌석 검증
-  │ 3-a. (pay=true) KakaoPay Ready API 호출 → TID 발급
-  │ 3-b. (pay=false) 내부 결제 시뮬레이션
+  │ 2. Redis 락 획득 → 좌석 가격/상태 재검증
+  │ 3-a. pay=true  → KakaoPay Ready 호출, TID 저장, 결제 URL 응답
+  │ 3-b. pay=false → 내부 결제 시뮬레이션, 티켓 서버 즉시 호출
   ▼
 Ticket 서비스
-  │ 4. `sendPurchaseRequest`로 좌석 예약 정보 전달
-  │ 5. 좌석 상태를 `reservationStatus=YES`로 갱신
+  │ 4. `sendPurchaseRequest`로 좌석 정보 전달
+  │ 5. 좌석 상태 `reservationStatus=YES`로 갱신
   ▼
 사용자
-  │ 6. 결제 URL 또는 예약 결과 응답
+  │ 6. 결제 완료 후 KakaoPay 승인 콜백 → 티켓 발급 확정
 ```
 
-- 모든 단계는 JWT 토큰에서 추출한 사용자 정보로 추적됩니다.
-- 결제가 완료되면 Ticket 서비스가 구매 내역을 저장하고, 필요 시 Merch 서비스와 연동해 번들 상품을 제안할 수 있습니다.
+- `sendPurchaseRequest`는 좌석 정보를 티켓 서비스 API로 전송하고 성공 시 `confirmSeatPurchase`에서 좌석 예약 상태를 업데이트합니다.【F:BE-SEAT/BE-SEAT-YES-NUMBER-YES-KAKAO/src/main/java/com/example/bemsaseat/seat/service/SeatService.java†L155-L222】
+- 승인 이후 Ticket 서비스가 실제 티켓을 생성하며, 필요 시 Merch 서비스와 연계해 번들 상품을 제안할 수 있습니다.
 
 ## 로컬 실행 가이드
 
@@ -84,13 +147,7 @@ cd BE-AUTH
 ./gradlew bootRun
 ```
 
-Redis, Kafka, MySQL, S3 등 외부 의존성은 별도로 구성해야 하며, `application.properties`에서 호스트 정보를 수정합니다.
-
-## 개발 노트
-
-- **Kafka**: 회원 가입 이벤트를 발행하고, 실패한 이메일 전송은 `email-retry` 토픽을 구독하는 `EmailRetryConsumer`에서 재시도합니다.
-- **S3 통합**: Event 서비스는 공연 이미지/설명/머천다이즈 이미지를 S3에 업로드하고, URL을 저장합니다.
-- **모듈 분리**: 좌석/티켓/머천다이즈 서비스는 공통 JWT 설정을 공유하지만 도메인 로직은 각자의 패키지로 격리되어 있습니다.
+Redis, Kafka, MySQL, S3 등 외부 인프라는 별도로 준비해야 하며 `application.properties`에서 호스트 정보를 수정합니다.
 
 ## 디렉터리 구조
 
@@ -98,9 +155,9 @@ Redis, Kafka, MySQL, S3 등 외부 의존성은 별도로 구성해야 하며, `
 Clove-BE/
 ├── BE-AUTH/        # 인증 서비스 (JWT, Kafka)
 ├── BE-EVENT/       # 공연 이벤트 관리 (S3 업로드)
-├── BE-SEAT/        # 좌석 서비스 (Redis 락, 결제 연동)
+├── BE-SEAT/        # 좌석 서비스 (Redis 락, KakaoPay)
 ├── BE-TICKET/      # 티켓 발급 서비스
-└── BE-MERCH/       # 굿즈 서비스
+└── BE-MERCH/       # 굿즈 서비스 (KakaoPay + 환불)
 ```
 
 ## 참고 링크
